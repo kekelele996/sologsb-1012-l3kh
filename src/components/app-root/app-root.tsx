@@ -1,10 +1,15 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
   cloneProject,
+  createClassroomReceipt,
   createDemoProject,
+  formatReceiptTime,
+  latestFollowState,
+  reconcileReceipt,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
+  TABLET_STORAGE_KEY,
   validateProject,
   type CameraAngle,
   type CaptionPosition,
@@ -12,11 +17,14 @@ import {
   type CourseProject,
   type Difficulty,
   type GestureZone,
+  type LearningReceipt,
   type LessonStep,
+  type ReceiptStatus,
   type ValidationCheck,
 } from '../../models';
 
 type PreviewSize = 'phone' | 'tablet';
+type PanelName = 'editor' | 'checks' | 'receipts';
 
 @Component({
   tag: 'app-root',
@@ -26,11 +34,14 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: PanelName = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  /** 教室平板上缓存的课程快照（常与编排台错开）与课堂端待回传回执 */
+  @State() tabletSnapshot: CourseProject = createDemoProject();
+  @State() tabletHeldReceipts: LearningReceipt[] = [];
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -42,6 +53,32 @@ export class AppRoot {
     } catch {
       this.project = createDemoProject();
     }
+    this.normalizeProject(this.project);
+    try {
+      const tabletSaved = localStorage.getItem(TABLET_STORAGE_KEY);
+      if (tabletSaved) {
+        const parsed = JSON.parse(tabletSaved) as { snapshot?: CourseProject; heldReceipts?: LearningReceipt[] };
+        if (parsed.snapshot) {
+          this.tabletSnapshot = parsed.snapshot;
+          this.normalizeProject(this.tabletSnapshot);
+        } else {
+          this.tabletSnapshot = cloneProject(this.project);
+        }
+        this.tabletHeldReceipts = parsed.heldReceipts ?? [];
+      } else {
+        this.tabletSnapshot = cloneProject(this.project);
+      }
+    } catch {
+      this.tabletSnapshot = cloneProject(this.project);
+    }
+  }
+
+  /** 兼容旧版本地数据：补齐回执列表与步骤修改时间 */
+  private normalizeProject(project: CourseProject): void {
+    project.receipts ??= [];
+    project.modules.forEach((module) => module.steps.forEach((step) => {
+      step.lastModifiedAt ??= project.lastSavedAt;
+    }));
   }
 
   disconnectedCallback(): void {
@@ -101,6 +138,81 @@ export class AppRoot {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
 
+  private persistTablet(): void {
+    localStorage.setItem(TABLET_STORAGE_KEY, JSON.stringify({ snapshot: this.tabletSnapshot, heldReceipts: this.tabletHeldReceipts }));
+  }
+
+  /** 把当前课程推送到教室平板；平板课程与编排台错开时，回执按步骤编号对账 */
+  private pushCourseToTablet(): void {
+    this.tabletSnapshot = cloneProject(this.project);
+    this.persistTablet();
+    this.showToast('success', '已把当前课程推送到教室平板；平板与编排台错开时，以步骤编号对账。');
+  }
+
+  /** 下课后在课堂端根据平板快照生成学习回执，暂存课堂端等待回传 */
+  private generateClassroomReceipt(): void {
+    const total = this.tabletSnapshot.modules.reduce((sum, item) => sum + item.steps.length, 0);
+    if (total === 0) {
+      this.showToast('warning', '平板上还没有学习步骤，请先推送课程到平板。');
+      return;
+    }
+    const receipt = createClassroomReceipt(this.tabletSnapshot);
+    this.tabletHeldReceipts = [receipt, ...this.tabletHeldReceipts];
+    this.persistTablet();
+    const missed = receipt.records.filter((record) => !record.followed).length;
+    this.showToast('medium', `已在课堂端生成回执：${receipt.records.length} 步，${missed} 步未跟完，等待回传。`);
+  }
+
+  /** 回传回执：失败后从课堂那一侧重试；已对上的步骤不动，只更新回执本身 */
+  private deliverReceipt(receipt: LearningReceipt): void {
+    // 同一份回执重复送来只并入一次
+    const existing = this.project.receipts.find((item) => item.id === receipt.id);
+    if (existing?.status === 'merged') {
+      this.showToast('medium', '同一份回执已并入，重复送达只并入一次。');
+      return;
+    }
+    if (existing?.status === 'void') {
+      this.showToast('medium', '该回执已作废，等待下一次课堂确认，无需重复回传。');
+      return;
+    }
+
+    // 回传：离线或网络抖动会失败，可从课堂那一侧重试
+    const online = !this.offline && Math.random() > 0.25;
+    if (!online) {
+      const failReason = this.offline ? '编排台处于离线状态，回执未能送达。' : '网络抖动，回执在回传途中失败。';
+      this.upsertReceipt({ ...receipt, status: 'failed', failReason, receivedAt: new Date().toISOString() });
+      this.removeHeldReceipt(receipt.id);
+      this.showToast('warning', '回执回传失败，请从课堂那一侧重试。');
+      return;
+    }
+
+    // 对账：按步骤编号与现在的课程核对，已对上的步骤不动
+    const reconciled = reconcileReceipt(this.project, { ...receipt, receivedAt: new Date().toISOString() });
+    this.upsertReceipt(reconciled);
+    this.removeHeldReceipt(receipt.id);
+    if (reconciled.status === 'void') {
+      this.showToast('danger', '对账发现步骤在回执之后改过，本次回执作废；课程修改照常进行。');
+    } else {
+      const missed = reconciled.records.filter((record) => !record.followed).length;
+      this.showToast('success', `课堂回执已并入：${reconciled.records.length} 步已对账，${missed} 步课堂未跟完。`);
+    }
+  }
+
+  private removeHeldReceipt(receiptId: string): void {
+    if (!this.tabletHeldReceipts.some((item) => item.id === receiptId)) return;
+    this.tabletHeldReceipts = this.tabletHeldReceipts.filter((item) => item.id !== receiptId);
+    this.persistTablet();
+  }
+
+  private upsertReceipt(receipt: LearningReceipt): void {
+    const index = this.project.receipts.findIndex((item) => item.id === receipt.id);
+    const receipts = index >= 0
+      ? this.project.receipts.map((item) => item.id === receipt.id ? receipt : item)
+      : [receipt, ...this.project.receipts];
+    this.project = { ...this.project, receipts };
+    this.persist();
+  }
+
   private commit(update: (draft: CourseProject) => CourseProject, toast?: string): void {
     if (this.project.status === 'frozen') {
       this.showToast('warning', '当前版本已冻结，请先创建修订版。');
@@ -154,11 +266,12 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    const now = new Date().toISOString();
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
         ...module,
-        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
+        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch, lastModifiedAt: now } : step),
       } : module),
     }), toast);
   }
@@ -205,6 +318,7 @@ export class AppRoot {
       prerequisiteId: prior?.id ?? '',
       difficulty: '入门',
       cuePoints: [8, 20, 32],
+      lastModifiedAt: new Date().toISOString(),
     };
     this.commit((draft) => ({
       ...draft,
@@ -221,7 +335,7 @@ export class AppRoot {
       modules: draft.modules.map((module) => {
         if (module.id !== draft.selectedModuleId) return module;
         const index = module.steps.findIndex((item) => item.id === step.id);
-        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）` };
+        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）`, lastModifiedAt: new Date().toISOString() };
         return { ...module, steps: [...module.steps.slice(0, index + 1), duplicate, ...module.steps.slice(index + 1)] };
       }),
     }), '已复制当前步骤。');
@@ -342,6 +456,7 @@ export class AppRoot {
   private renderStepListItem(step: LessonStep, index: number) {
     const active = step.id === this.currentStep?.id;
     const issueCount = this.checks.filter((check) => check.stepId === step.id && check.severity !== 'info').length;
+    const followState = latestFollowState(this.project, step.id);
     return (
       <button class={`step-list-item ${active ? 'active' : ''}`} onClick={() => this.selectStep(step.id)}>
         <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
@@ -349,6 +464,9 @@ export class AppRoot {
           <strong>{step.title}</strong>
           <small>{step.kind} · {step.duration}s · {step.difficulty}</small>
         </span>
+        {followState !== undefined && (
+          <span class={`step-class-dot ${followState ? 'followed' : 'missed'}`} title={followState ? '最近课堂已跟完' : '最近课堂未跟完'} />
+        )}
         {issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
       </button>
     );
@@ -368,6 +486,7 @@ export class AppRoot {
     }
     const frozen = this.project.status === 'frozen';
     const module = this.currentModule;
+    const followState = latestFollowState(this.project, step.id);
     const prerequisites = module.steps.filter((candidate, index) => candidate.id !== step.id && index < module.steps.findIndex((item) => item.id === step.id));
     return (
       <div class="step-editor">
@@ -376,6 +495,9 @@ export class AppRoot {
             <span class="eyebrow">学习步骤 {module.steps.findIndex((item) => item.id === step.id) + 1}</span>
             <h1>{step.title}</h1>
             <p>最后修改 {this.formatDate(this.project.lastSavedAt)} · 修订号 {this.project.revision}</p>
+            {followState !== undefined && (
+              <span class={`step-class-status ${followState ? 'followed' : 'missed'}`}>{followState ? '最近课堂已跟完' : '最近课堂未跟完'}</span>
+            )}
           </div>
           <div class="title-actions">
             <ion-button fill="clear" class="studio-button" onClick={() => this.moveStep(-1)} title="Alt + ↑">上移</ion-button>
@@ -540,6 +662,105 @@ export class AppRoot {
     );
   }
 
+  private renderReceiptStatusBadge(status: ReceiptStatus) {
+    if (status === 'merged') return <ion-badge color="success">已并入</ion-badge>;
+    if (status === 'void') return <ion-badge color="danger">已作废</ion-badge>;
+    return <ion-badge color="warning">回传失败</ion-badge>;
+  }
+
+  private renderReceiptCard(receipt: LearningReceipt) {
+    const missed = receipt.records.filter((record) => !record.followed).length;
+    return (
+      <article class={`receipt-card status-${receipt.status}`} key={receipt.id}>
+        <div class="receipt-card-head">
+          <div>
+            <strong>{receipt.label}</strong>
+            <small>上课 {formatReceiptTime(receipt.taughtAt)}{receipt.receivedAt ? ` · 送达 ${formatReceiptTime(receipt.receivedAt)}` : ''}</small>
+          </div>
+          {this.renderReceiptStatusBadge(receipt.status)}
+        </div>
+        {receipt.status === 'failed' && <p class="receipt-reason fail">{receipt.failReason}</p>}
+        {receipt.status === 'void' && <p class="receipt-reason void">{receipt.voidReason}</p>}
+        {receipt.status === 'merged' && (
+          <p class="receipt-reason merged">已并入{receipt.mergedAt ? ` ${formatReceiptTime(receipt.mergedAt)}` : ''} · {receipt.records.length} 步已对账，{missed} 步课堂未跟完</p>
+        )}
+        <ul class="receipt-records">
+          {receipt.records.map((record) => (
+            <li class={`receipt-record ${record.followed ? 'followed' : 'missed'} ${record.matched === false ? 'unmatched' : ''}`} key={record.stepId}>
+              <span class="record-index">{String(record.stepNumber).padStart(2, '0')}</span>
+              <span class="record-copy">
+                <strong>{record.title}</strong>
+                <small>{record.matched === false ? '步骤已不在当前课程中' : record.followed ? '课堂已跟完' : '课堂未跟完'}</small>
+              </span>
+              <span class="record-flag">{record.followed ? '✓' : '!'}</span>
+            </li>
+          ))}
+        </ul>
+        {receipt.status === 'failed' && (
+          <div class="receipt-card-actions">
+            <ion-button size="small" class="studio-button" onClick={() => this.deliverReceipt(receipt)}>从课堂侧重试回传</ion-button>
+          </div>
+        )}
+      </article>
+    );
+  }
+
+  private renderReceipts() {
+    const receipts = this.project.receipts;
+    const failed = receipts.filter((receipt) => receipt.status === 'failed').length;
+    const voided = receipts.filter((receipt) => receipt.status === 'void').length;
+    const merged = receipts.filter((receipt) => receipt.status === 'merged').length;
+    return (
+      <section class="receipts-panel">
+        <div class="receipts-summary">
+          <div class="check-stat danger"><strong>{failed}</strong><span>回传失败</span></div>
+          <div class="check-stat warning"><strong>{voided}</strong><span>已作废</span></div>
+          <div class="check-stat"><strong>{merged}</strong><span>已并入</span></div>
+        </div>
+
+        <div class="receipt-classroom-card">
+          <div class="receipt-classroom-head">
+            <div>
+              <span class="eyebrow">课堂端</span>
+              <h3>平板课程与学习回执</h3>
+            </div>
+            <span class="tablet-sync-time">平板版本：{formatReceiptTime(this.tabletSnapshot.lastSavedAt)}</span>
+          </div>
+          <p class="receipt-classroom-note">平板上的课程常与编排台错开。下课后在课堂端生成学习回执，回传后按步骤编号与当前课程对账；步骤在回执之后改过的，回执先作废，等下一次课堂确认。</p>
+          <div class="receipt-classroom-actions">
+            <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.pushCourseToTablet()}>推送当前课程到平板</ion-button>
+            <ion-button size="small" class="studio-button" onClick={() => this.generateClassroomReceipt()}>下课，生成课堂回执</ion-button>
+          </div>
+          {this.tabletHeldReceipts.length > 0 && (
+            <div class="receipt-held-list">
+              <span class="eyebrow">课堂端待回传（{this.tabletHeldReceipts.length}）</span>
+              {this.tabletHeldReceipts.map((receipt) => (
+                <div class="receipt-held-item" key={receipt.id}>
+                  <div>
+                    <strong>{receipt.label}</strong>
+                    <small>{receipt.records.length} 步 · {receipt.records.filter((record) => !record.followed).length} 步未跟完</small>
+                  </div>
+                  <ion-button size="small" class="studio-button" onClick={() => this.deliverReceipt(receipt)}>回传回执</ion-button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div class="receipt-inbox">
+          <span class="eyebrow">编排台收件箱</span>
+          {receipts.length === 0 && (
+            <div class="all-clear">
+              <strong>暂无课堂回执</strong>
+              <p>下课后从课堂端回传学习回执，按步骤编号对账的结果会显示在这里。</p>
+            </div>
+          )}
+          {receipts.map((receipt) => this.renderReceiptCard(receipt))}
+        </div>
+      </section>
+    );
+  }
+
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
@@ -609,8 +830,14 @@ export class AppRoot {
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'receipts' ? 'active' : ''} onClick={() => { this.activePanel = 'receipts'; }}>
+                    课堂回执
+                    {this.project.receipts.some((receipt) => receipt.status === 'failed') && <span>{this.project.receipts.filter((receipt) => receipt.status === 'failed').length}</span>}
+                  </button>
                 </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                <div class="editor-scroll">
+                  {this.activePanel === 'editor' ? this.renderStepEditor() : this.activePanel === 'checks' ? this.renderChecks() : this.renderReceipts()}
+                </div>
               </section>
 
               {this.renderPreview()}

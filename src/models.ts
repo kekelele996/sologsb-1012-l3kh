@@ -23,6 +23,8 @@ export interface LessonStep {
   prerequisiteId: string;
   difficulty: Difficulty;
   cuePoints: number[];
+  /** 步骤最后一次被编排台修改的时间，用于与课堂回执对账 */
+  lastModifiedAt: string;
 }
 
 export interface CourseModule {
@@ -50,8 +52,39 @@ export interface CourseProject {
   selectedStepId: string;
   modules: CourseModule[];
   frozenVersions: FrozenVersion[];
+  /** 课堂端回传的学习回执（草稿与冻结快照各留一份） */
+  receipts: LearningReceipt[];
   lastSavedAt: string;
   revision: number;
+}
+
+/** 回执在课堂端暂存 / 回传失败 / 已并入 / 已作废 */
+export type ReceiptStatus = 'held' | 'failed' | 'merged' | 'void';
+
+export interface ReceiptStepRecord {
+  stepId: string;
+  moduleId: string;
+  /** 课堂端记录的步骤编号（模块内序号），用于按编号对账 */
+  stepNumber: number;
+  title: string;
+  /** 课堂上学生是否跟完该步骤 */
+  followed: boolean;
+  /** 对账时是否在当前课程中找到了对应步骤 */
+  matched: boolean;
+}
+
+export interface LearningReceipt {
+  id: string;
+  label: string;
+  /** 上课时间，回执对账的时间基准 */
+  taughtAt: string;
+  /** 送达编排台的时间 */
+  receivedAt: string;
+  records: ReceiptStepRecord[];
+  status: ReceiptStatus;
+  failReason?: string;
+  voidReason?: string;
+  mergedAt?: string;
 }
 
 export interface ValidationCheck {
@@ -64,8 +97,10 @@ export interface ValidationCheck {
 }
 
 export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
+export const TABLET_STORAGE_KEY = 'sologsb-1012-sign-course-tablet-v1';
 
 export function createDemoProject(): CourseProject {
+  const now = new Date().toISOString();
   const modules: CourseModule[] = [
     {
       id: 'module-1',
@@ -92,6 +127,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [4, 16, 28],
+          lastModifiedAt: now,
         },
         {
           id: 'step-1-2',
@@ -112,6 +148,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-1',
           difficulty: '入门',
           cuePoints: [6, 24, 42],
+          lastModifiedAt: now,
         },
         {
           id: 'step-1-3',
@@ -132,6 +169,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-2',
           difficulty: '进阶',
           cuePoints: [10, 34, 57],
+          lastModifiedAt: now,
         },
       ],
     },
@@ -160,6 +198,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [8, 26, 44],
+          lastModifiedAt: now,
         },
         {
           id: 'step-2-2',
@@ -180,6 +219,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-2-1',
           difficulty: '进阶',
           cuePoints: [5, 22, 37],
+          lastModifiedAt: now,
         },
       ],
     },
@@ -195,7 +235,8 @@ export function createDemoProject(): CourseProject {
     selectedStepId: 'step-1-2',
     modules,
     frozenVersions: [],
-    lastSavedAt: new Date().toISOString(),
+    receipts: [],
+    lastSavedAt: now,
     revision: 1,
   };
 }
@@ -253,4 +294,81 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
 
 export function cloneProject(project: CourseProject): CourseProject {
   return structuredClone(project);
+}
+
+const receiptTimeFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+export function formatReceiptTime(value: string): string {
+  return receiptTimeFormatter.format(new Date(value));
+}
+
+/**
+ * 课堂端根据平板上的课程快照生成学习回执。
+ * 平板课程可能与编排台错开，回执只记录步骤编号和跟完情况。
+ */
+export function createClassroomReceipt(snapshot: CourseProject): LearningReceipt {
+  const records: ReceiptStepRecord[] = [];
+  snapshot.modules.forEach((module) => {
+    module.steps.forEach((step, index) => {
+      // 难度越高、时长越长的步骤，课堂上越容易没跟完
+      const missChance = 0.24
+        + (step.difficulty === '挑战' ? 0.12 : step.difficulty === '进阶' ? 0.06 : 0)
+        + (step.duration > 60 ? 0.06 : 0);
+      const followed = Math.random() > Math.min(0.7, missChance);
+      records.push({ stepId: step.id, moduleId: module.id, stepNumber: index + 1, title: step.title, followed, matched: false });
+    });
+  });
+  const now = new Date().toISOString();
+  return {
+    id: `receipt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    label: `课堂回执 · ${formatReceiptTime(now)}`,
+    taughtAt: now,
+    receivedAt: '',
+    records,
+    status: 'held',
+  };
+}
+
+/**
+ * 编排台按步骤编号与现在的课程对账：
+ * - 步骤在回执（上课时间）之后被改过 → 整份回执作废，等下一次课堂确认；课程修改不受影响
+ * - 对账只更新回执本身，不改动任何步骤，因此重试时已对上的步骤保持不动
+ */
+export function reconcileReceipt(project: CourseProject, receipt: LearningReceipt): LearningReceipt {
+  const stepIndex = new Map<string, LessonStep>();
+  project.modules.forEach((module) => module.steps.forEach((step) => stepIndex.set(step.id, step)));
+
+  const modifiedTitles: string[] = [];
+  const records = receipt.records.map((record) => {
+    const step = stepIndex.get(record.stepId);
+    if (!step) return { ...record, matched: false };
+    const modifiedAt = step.lastModifiedAt ?? '';
+    if (modifiedAt > receipt.taughtAt) modifiedTitles.push(step.title);
+    return { ...record, matched: true };
+  });
+
+  if (modifiedTitles.length > 0) {
+    return {
+      ...receipt,
+      records,
+      status: 'void',
+      voidReason: `步骤在回执（${formatReceiptTime(receipt.taughtAt)}）之后被修改：${modifiedTitles.join('、')}。本回执作废，等待下一次课堂确认；课程修改照常进行。`,
+    };
+  }
+  return { ...receipt, records, status: 'merged', mergedAt: new Date().toISOString() };
+}
+
+/** 最近一次已并入回执中某步骤的课堂跟完情况；无记录时返回 undefined。 */
+export function latestFollowState(project: CourseProject, stepId: string): boolean | undefined {
+  let state: boolean | undefined;
+  let latest = '';
+  project.receipts.forEach((receipt) => {
+    if (receipt.status !== 'merged' || receipt.receivedAt < latest) return;
+    const record = receipt.records.find((item) => item.stepId === stepId);
+    if (record) {
+      latest = receipt.receivedAt;
+      state = record.followed;
+    }
+  });
+  return state;
 }

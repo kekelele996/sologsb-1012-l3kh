@@ -1,22 +1,33 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  CLASSROOM_STORAGE_KEY,
   cloneProject,
   createDemoProject,
+  emptyReceiptBook,
+  emptyTabletState,
+  migrateProject,
+  RECEIPT_STORAGE_KEY,
+  reconcileReceipt,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
   validateProject,
   type CameraAngle,
   type CaptionPosition,
+  type ClassroomTabletState,
   type CourseModule,
   type CourseProject,
   type Difficulty,
   type GestureZone,
   type LessonStep,
+  type OutboxReceipt,
+  type ProcessedReceiptEntry,
+  type ReceiptBook,
   type ValidationCheck,
 } from '../../models';
 
 type PreviewSize = 'phone' | 'tablet';
+type PanelView = 'editor' | 'checks' | 'receipts';
 
 @Component({
   tag: 'app-root',
@@ -25,8 +36,10 @@ type PreviewSize = 'phone' | 'tablet';
 })
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
+  @State() receiptBook: ReceiptBook = emptyReceiptBook();
+  @State() tablet: ClassroomTabletState = emptyTabletState();
   @State() previewSize: PreviewSize = 'phone';
-  @State() activePanel: 'editor' | 'checks' = 'editor';
+  @State() activePanel: PanelView = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
@@ -38,9 +51,21 @@ export class AppRoot {
   componentWillLoad(): void {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      if (saved) this.project = migrateProject(JSON.parse(saved) as CourseProject);
     } catch {
       this.project = createDemoProject();
+    }
+    try {
+      const savedReceipts = localStorage.getItem(RECEIPT_STORAGE_KEY);
+      if (savedReceipts) this.receiptBook = JSON.parse(savedReceipts) as ReceiptBook;
+    } catch {
+      this.receiptBook = emptyReceiptBook();
+    }
+    try {
+      const savedTablet = localStorage.getItem(CLASSROOM_STORAGE_KEY);
+      if (savedTablet) this.tablet = JSON.parse(savedTablet) as ClassroomTabletState;
+    } catch {
+      this.tablet = emptyTabletState();
     }
   }
 
@@ -101,6 +126,14 @@ export class AppRoot {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
 
+  private persistReceipts(): void {
+    localStorage.setItem(RECEIPT_STORAGE_KEY, JSON.stringify(this.receiptBook));
+  }
+
+  private persistTablet(): void {
+    localStorage.setItem(CLASSROOM_STORAGE_KEY, JSON.stringify(this.tablet));
+  }
+
   private commit(update: (draft: CourseProject) => CourseProject, toast?: string): void {
     if (this.project.status === 'frozen') {
       this.showToast('warning', '当前版本已冻结，请先创建修订版。');
@@ -154,11 +187,12 @@ export class AppRoot {
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    const updatedAt = new Date().toISOString();
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => module.id === draft.selectedModuleId ? {
         ...module,
-        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
+        steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch, updatedAt } : step),
       } : module),
     }), toast);
   }
@@ -205,6 +239,7 @@ export class AppRoot {
       prerequisiteId: prior?.id ?? '',
       difficulty: '入门',
       cuePoints: [8, 20, 32],
+      updatedAt: new Date().toISOString(),
     };
     this.commit((draft) => ({
       ...draft,
@@ -221,7 +256,7 @@ export class AppRoot {
       modules: draft.modules.map((module) => {
         if (module.id !== draft.selectedModuleId) return module;
         const index = module.steps.findIndex((item) => item.id === step.id);
-        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）` };
+        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）`, updatedAt: new Date().toISOString() };
         return { ...module, steps: [...module.steps.slice(0, index + 1), duplicate, ...module.steps.slice(index + 1)] };
       }),
     }), '已复制当前步骤。');
@@ -245,6 +280,7 @@ export class AppRoot {
   private moveStep(direction: number): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
+    const updatedAt = new Date().toISOString();
     this.commit((draft) => ({
       ...draft,
       modules: draft.modules.map((module) => {
@@ -254,7 +290,7 @@ export class AppRoot {
         if (index === nextIndex) return module;
         const steps = [...module.steps];
         const [item] = steps.splice(index, 1);
-        steps.splice(nextIndex, 0, item);
+        steps.splice(nextIndex, 0, { ...item, updatedAt });
         return { ...module, steps };
       }),
     }), '已调整步骤顺序。');
@@ -291,6 +327,7 @@ export class AppRoot {
       this.showToast('danger', `冻结前仍有 ${blocking.length} 个阻断问题。`);
       return;
     }
+    const receiptBookSnapshot = structuredClone(this.receiptBook);
     this.commit((draft) => {
       const { frozenVersions, ...snapshot } = cloneProject(draft);
       const version = {
@@ -298,14 +335,102 @@ export class AppRoot {
         label: `冻结版本 v${frozenVersions.length + 1}`,
         createdAt: new Date().toISOString(),
         snapshot,
+        receiptBook: receiptBookSnapshot,
       };
-      return { ...draft, status: 'frozen', frozenVersions: [version, ...frozenVersions] };
-    }, '当前课程版本已冻结。');
+      return { ...draft, status: 'frozen' as const, frozenVersions: [version, ...frozenVersions] };
+    }, '当前课程版本已冻结，课堂对账台账已随版本留档。');
     this.playing = false;
   }
 
   private reviseFrozen(): void {
     this.commit((draft) => ({ ...draft, status: 'draft' }), '已创建修订版，可继续编辑。');
+  }
+
+  /** 课堂端：把编排台当前课程同步到平板（平板上的课程常与编排台错开） */
+  private syncTablet(): void {
+    const steps = this.project.modules.flatMap((module) =>
+      module.steps.map((step) => ({ id: step.id, title: step.title, moduleTitle: module.title })),
+    );
+    this.tablet = {
+      ...this.tablet,
+      syncedAt: new Date().toISOString(),
+      steps,
+      checkedStepIds: this.tablet.checkedStepIds.filter((id) => steps.some((step) => step.id === id)),
+    };
+    this.persistTablet();
+    this.showToast('success', `已同步 ${steps.length} 个步骤到课堂平板。`);
+  }
+
+  private toggleTabletStep(stepId: string): void {
+    const checked = new Set(this.tablet.checkedStepIds);
+    checked.has(stepId) ? checked.delete(stepId) : checked.add(stepId);
+    this.tablet = { ...this.tablet, checkedStepIds: [...checked] };
+    this.persistTablet();
+  }
+
+  /** 课堂端：按平板上的课程签发学习回执并尝试回传编排台 */
+  private issueReceipt(): void {
+    if (!this.tablet.steps.length) {
+      this.showToast('warning', '请先把课程同步到课堂平板。');
+      return;
+    }
+    const checked = new Set(this.tablet.checkedStepIds);
+    const receipt: OutboxReceipt = {
+      id: `receipt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      device: this.tablet.device,
+      issuedAt: new Date().toISOString(),
+      entries: this.tablet.steps.map((step) => ({ stepId: step.id, title: step.title, completed: checked.has(step.id) })),
+      sendState: 'pending',
+      attempts: 0,
+    };
+    this.tablet = { ...this.tablet, outbox: [receipt, ...this.tablet.outbox] };
+    this.persistTablet();
+    this.deliverReceipt(receipt.id);
+  }
+
+  /** 课堂端 → 编排台：回传回执；失败留在课堂一侧发件箱，可从课堂侧重试 */
+  private deliverReceipt(receiptId: string): void {
+    const receipt = this.tablet.outbox.find((item) => item.id === receiptId);
+    if (!receipt) return;
+    const attempts = receipt.attempts + 1;
+    if (this.offline) {
+      this.tablet = {
+        ...this.tablet,
+        outbox: this.tablet.outbox.map((item) => item.id === receiptId ? { ...item, sendState: 'failed' as const, attempts } : item),
+      };
+      this.persistTablet();
+      this.showToast('warning', '回传失败，回执已留在课堂端发件箱，恢复在线后可从课堂侧重试。');
+      return;
+    }
+
+    const { id, device, issuedAt, entries } = receipt;
+    const result = reconcileReceipt(this.project, this.receiptBook, { id, device, issuedAt, entries }, new Date().toISOString());
+    const ack = result.kind;
+    const ackNote = result.kind === 'duplicate'
+      ? '编排台已并入过这份回执，重复送达只并入一次。'
+      : result.receipt.note;
+    this.tablet = {
+      ...this.tablet,
+      outbox: this.tablet.outbox.map((item) => item.id === receiptId ? { ...item, sendState: 'delivered' as const, attempts, ack, ackNote } : item),
+    };
+    this.persistTablet();
+
+    if (result.kind === 'duplicate') {
+      this.showToast('medium', '重复回执：编排台已并入过，本次不再重复记账。');
+      return;
+    }
+    this.receiptBook = result.book;
+    this.persistReceipts();
+    if (result.kind === 'voided') {
+      this.showToast('warning', `回执已作废：${result.receipt.note} 课程可照常继续编辑。`);
+    } else {
+      this.showToast('success', `回执已并入：${result.receipt.note}`);
+    }
+  }
+
+  private removeOutboxReceipt(receiptId: string): void {
+    this.tablet = { ...this.tablet, outbox: this.tablet.outbox.filter((item) => item.id !== receiptId) };
+    this.persistTablet();
   }
 
   private togglePlay(): void {
@@ -540,6 +665,146 @@ export class AppRoot {
     );
   }
 
+  private get confirmationStats(): { confirmed: number; total: number } {
+    const total = this.project.modules.reduce((sum, module) => sum + module.steps.length, 0);
+    const confirmed = this.project.modules.reduce(
+      (sum, module) => sum + module.steps.filter((step) => this.receiptBook.confirmations[step.id]).length,
+      0,
+    );
+    return { confirmed, total };
+  }
+
+  private outcomeLabel(outcome: ProcessedReceiptEntry['outcome']): string {
+    switch (outcome) {
+      case 'confirmed': return '新确认';
+      case 'already-confirmed': return '此前已对账';
+      case 'missing-step': return '编号不存在';
+      case 'voided-stale': return '签发后被改';
+      case 'voided': return '随回执作废';
+    }
+  }
+
+  private renderReceipts() {
+    const stats = this.confirmationStats;
+    const confirmations = this.receiptBook.confirmations;
+    return (
+      <section class="receipts-panel">
+        <div class="form-card">
+          <div class="section-title">
+            <span>课</span>
+            <div><h2>课堂端 · {this.tablet.device}</h2><p>平板上的课程常与编排台错开，学习回执在这里签发并回传</p></div>
+          </div>
+          <div class="tablet-sync-row">
+            <span>{this.tablet.syncedAt ? `上次同步 ${this.formatDate(this.tablet.syncedAt)} · 平板上有 ${this.tablet.steps.length} 个步骤` : '平板还没有课程，请先同步'}</span>
+            <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.syncTablet()}>同步课程到平板</ion-button>
+          </div>
+          {this.tablet.steps.length > 0 && (
+            <div class="tablet-steps">
+              <p class="tablet-hint">勾选学生已跟完的步骤，未勾选的步骤会按“未跟完”写进回执：</p>
+              {this.tablet.steps.map((step, index) => (
+                <label class="tablet-step" key={step.id}>
+                  <input type="checkbox" checked={this.tablet.checkedStepIds.includes(step.id)} onChange={() => this.toggleTabletStep(step.id)} />
+                  <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
+                  <span class="tablet-step-copy"><strong>{step.title}</strong><small>{step.moduleTitle}</small></span>
+                </label>
+              ))}
+            </div>
+          )}
+          <ion-button class="studio-button issue-button" disabled={!this.tablet.steps.length} onClick={() => this.issueReceipt()}>签发回执并回传编排台</ion-button>
+          {this.tablet.outbox.length > 0 && (
+            <div class="outbox-list">
+              <span class="eyebrow">课堂端发件箱</span>
+              {this.tablet.outbox.map((receipt) => (
+                <div class={`outbox-item ${receipt.sendState}`} key={receipt.id}>
+                  <div class="outbox-main">
+                    <strong>{receipt.id}</strong>
+                    <small>签发 {this.formatDate(receipt.issuedAt)} · 完成 {receipt.entries.filter((entry) => entry.completed).length}/{receipt.entries.length} 步 · 回传尝试 {receipt.attempts} 次</small>
+                    {receipt.sendState === 'failed' && <small class="ack failed">回传失败，回执留在课堂一侧，可重试</small>}
+                    {receipt.ackNote && <small class={`ack ${receipt.ack}`}>{receipt.ack === 'merged' ? '编排台已并入' : receipt.ack === 'voided' ? '编排台已作废' : '重复回执已忽略'} · {receipt.ackNote}</small>}
+                  </div>
+                  <div class="outbox-actions">
+                    {receipt.sendState !== 'delivered' && (
+                      <ion-button size="small" fill="outline" class="studio-button" onClick={() => this.deliverReceipt(receipt.id)}>从课堂侧重试</ion-button>
+                    )}
+                    {receipt.sendState === 'delivered' && (
+                      <ion-button size="small" fill="clear" class="studio-button" title="模拟网络重试：同一份回执重复送达，编排台只并入一次" onClick={() => this.deliverReceipt(receipt.id)}>再次回传</ion-button>
+                    )}
+                    <ion-button size="small" fill="clear" color="danger" class="studio-button" onClick={() => this.removeOutboxReceipt(receipt.id)}>移除</ion-button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div class="form-card">
+          <div class="section-title">
+            <span>账</span>
+            <div><h2>编排台 · 对账台账（草稿）</h2><p>已确认 {stats.confirmed} / {stats.total} 步 · 收到回执 {this.receiptBook.receipts.length} 份</p></div>
+          </div>
+          <div class="ledger-list">
+            {this.project.modules.map((module) => (
+              <div class="ledger-module" key={module.id}>
+                <span class="ledger-module-title">{module.title}</span>
+                {module.steps.map((step, index) => {
+                  const confirmation = confirmations[step.id];
+                  return (
+                    <div class={`ledger-row ${confirmation ? (confirmation.completed ? 'done' : 'missed') : ''}`} key={step.id}>
+                      <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
+                      <span class="ledger-copy">
+                        <strong>{step.title}</strong>
+                        <small>{confirmation
+                          ? `${confirmation.completed ? '课堂已完成' : '课堂未跟完'} · ${confirmation.device} · 回执 ${confirmation.receiptId} · ${this.formatDate(confirmation.mergedAt)}`
+                          : '等待课堂回执对账'}</small>
+                      </span>
+                      <span class={`ledger-chip ${confirmation ? (confirmation.completed ? 'done' : 'missed') : 'pending'}`}>
+                        {confirmation ? (confirmation.completed ? '已完成' : '未跟完') : '未对账'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          {this.receiptBook.receipts.length > 0 && (
+            <div class="receipt-log">
+              <span class="eyebrow">回执处理记录</span>
+              {this.receiptBook.receipts.map((receipt) => (
+                <div class={`receipt-log-item ${receipt.status}`} key={receipt.id}>
+                  <div class="receipt-log-head">
+                    <strong>{receipt.id}</strong>
+                    <span class={`receipt-status ${receipt.status}`}>{receipt.status === 'merged' ? '已并入' : '已作废'}</span>
+                  </div>
+                  <small>{receipt.device} · 签发 {this.formatDate(receipt.issuedAt)} · 到达 {this.formatDate(receipt.receivedAt)}</small>
+                  <p>{receipt.note}{receipt.status === 'voided' ? ' 等课堂再一次确认，课程这边照常接着改。' : ''}</p>
+                  <div class="receipt-entries">
+                    {receipt.entries.map((entry) => (
+                      <span class={`entry-chip ${entry.outcome}`} key={entry.stepId}>{entry.completed ? '✓' : '✗'} {entry.title} · {this.outcomeLabel(entry.outcome)}</span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div class="form-card">
+          <div class="section-title">
+            <span>档</span>
+            <div><h2>冻结版本留档</h2><p>每次冻结都会把当时的对账台账随版本留一份，与草稿各留一份</p></div>
+          </div>
+          {this.project.frozenVersions.length === 0 && <p class="receipt-empty">还没有冻结版本，冻结后这里会列出每个版本留档的对账台账。</p>}
+          {this.project.frozenVersions.map((version) => (
+            <div class="frozen-receipt-row" key={version.id}>
+              <strong>{version.label}</strong>
+              <small>{this.formatDate(version.createdAt)} · 留档确认 {Object.keys(version.receiptBook?.confirmations ?? {}).length} 步 · 回执 {version.receiptBook?.receipts.length ?? 0} 份</small>
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
@@ -576,6 +841,7 @@ export class AppRoot {
                 <div><strong>{this.project.modules.length}</strong><span>模块</span></div>
                 <div><strong>{this.project.modules.reduce((sum, item) => sum + item.steps.length, 0)}</strong><span>步骤</span></div>
                 <div><strong>{Math.ceil(this.project.modules.reduce((sum, item) => sum + item.steps.reduce((total, lesson) => total + lesson.duration, 0), 0) / 60)}</strong><span>分钟</span></div>
+                <div><strong>{this.confirmationStats.confirmed}/{this.confirmationStats.total}</strong><span>课堂确认</span></div>
                 <div class={errors ? 'has-errors' : ''}><strong>{errors}</strong><span>阻断问题</span></div>
               </div>
               <div class="workflow-actions">
@@ -609,8 +875,11 @@ export class AppRoot {
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
                   <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'receipts' ? 'active' : ''} onClick={() => { this.activePanel = 'receipts'; }}>课堂回执 <span>{this.receiptBook.receipts.length}</span></button>
                 </div>
-                <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
+                <div class="editor-scroll">
+                  {this.activePanel === 'editor' ? this.renderStepEditor() : this.activePanel === 'checks' ? this.renderChecks() : this.renderReceipts()}
+                </div>
               </section>
 
               {this.renderPreview()}

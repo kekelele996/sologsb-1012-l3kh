@@ -23,6 +23,7 @@ export interface LessonStep {
   prerequisiteId: string;
   difficulty: Difficulty;
   cuePoints: number[];
+  updatedAt: string;
 }
 
 export interface CourseModule {
@@ -38,6 +39,8 @@ export interface FrozenVersion {
   label: string;
   createdAt: string;
   snapshot: Omit<CourseProject, 'frozenVersions'>;
+  /** 冻结时课堂对账台账的留档，与草稿各留一份 */
+  receiptBook?: ReceiptBook;
 }
 
 export interface CourseProject {
@@ -63,9 +66,160 @@ export interface ValidationCheck {
   moduleId?: string;
 }
 
+/** 课堂端回执里的单条步骤记录 */
+export interface ReceiptEntry {
+  stepId: string;
+  /** 课堂平板上看到的步骤标题，留档用（步骤之后在编排台被改名也不影响对账） */
+  title: string;
+  completed: boolean;
+}
+
+/** 课堂端签发、带回编排台的学习回执 */
+export interface LearningReceipt {
+  id: string;
+  device: string;
+  /** 课堂端签发时间，对账时与步骤 updatedAt 比较 */
+  issuedAt: string;
+  entries: ReceiptEntry[];
+}
+
+export type ReceiptEntryOutcome =
+  | 'confirmed'          // 新对上，已入台账
+  | 'already-confirmed'  // 该步骤此前已对过账，保持不动
+  | 'missing-step'       // 步骤编号在当前课程里已不存在
+  | 'voided-stale'       // 步骤在回执签发后被改过，导致整份回执作废
+  | 'voided';            // 受同回执其他条目牵连，一并作废
+
+export interface ProcessedReceiptEntry extends ReceiptEntry {
+  outcome: ReceiptEntryOutcome;
+}
+
+/** 编排台处理过的回执（含已作废），重复送达时按 id 去重 */
+export interface ProcessedReceipt extends LearningReceipt {
+  receivedAt: string;
+  status: 'merged' | 'voided';
+  entries: ProcessedReceiptEntry[];
+  note: string;
+}
+
+/** 某个步骤的课堂确认记录，一旦写入不再被后续回执覆盖 */
+export interface StepConfirmation {
+  stepId: string;
+  title: string;
+  completed: boolean;
+  receiptId: string;
+  device: string;
+  issuedAt: string;
+  mergedAt: string;
+}
+
+/** 编排台的课堂对账台账：回执记录 + 按步骤编号的确认结果 */
+export interface ReceiptBook {
+  receipts: ProcessedReceipt[];
+  confirmations: Record<string, StepConfirmation>;
+}
+
+/** 课堂端发件箱里的回执，回传失败后留在课堂一侧等待重试 */
+export interface OutboxReceipt extends LearningReceipt {
+  sendState: 'pending' | 'failed' | 'delivered';
+  attempts: number;
+  ack?: 'merged' | 'voided' | 'duplicate';
+  ackNote?: string;
+}
+
+/** 课堂平板一侧的状态：自己保存的课程快照（常与编排台错开）和发件箱 */
+export interface ClassroomTabletState {
+  device: string;
+  syncedAt: string;
+  steps: Array<{ id: string; title: string; moduleTitle: string }>;
+  checkedStepIds: string[];
+  outbox: OutboxReceipt[];
+}
+
+export type ReconcileResult =
+  | { kind: 'duplicate'; book: ReceiptBook }
+  | { kind: 'merged' | 'voided'; book: ReceiptBook; receipt: ProcessedReceipt };
+
+export function emptyReceiptBook(): ReceiptBook {
+  return { receipts: [], confirmations: {} };
+}
+
+export function emptyTabletState(): ClassroomTabletState {
+  return { device: '教室平板 01', syncedAt: '', steps: [], checkedStepIds: [], outbox: [] };
+}
+
+/**
+ * 编排台对账：把课堂端带回的回执按步骤编号与当前课程核对。
+ * - 同一份回执重复送来只并入一次（按回执 id 去重）；
+ * - 任一步骤在回执签发之后被改过，整份回执作废，等课堂再次确认，课程编辑不受影响；
+ * - 已经对上的步骤保持不动，后续回执不覆盖；
+ * - 步骤编号在当前课程里找不到的条目跳过，不影响其他条目并入。
+ */
+export function reconcileReceipt(project: CourseProject, book: ReceiptBook, receipt: LearningReceipt, receivedAt: string): ReconcileResult {
+  if (book.receipts.some((item) => item.id === receipt.id)) {
+    return { kind: 'duplicate', book };
+  }
+
+  const stepById = new Map<string, LessonStep>();
+  project.modules.forEach((module) => module.steps.forEach((step) => stepById.set(step.id, step)));
+
+  const staleStepIds = new Set(
+    receipt.entries
+      .filter((entry) => {
+        const step = stepById.get(entry.stepId);
+        return step !== undefined && step.updatedAt > receipt.issuedAt;
+      })
+      .map((entry) => entry.stepId),
+  );
+
+  if (staleStepIds.size > 0) {
+    const processed: ProcessedReceipt = {
+      ...receipt,
+      receivedAt,
+      status: 'voided',
+      entries: receipt.entries.map((entry) => ({
+        ...entry,
+        outcome: staleStepIds.has(entry.stepId) ? 'voided-stale' : 'voided',
+      })),
+      note: `${staleStepIds.size} 个步骤在回执签发后被修改，整份回执作废，等待课堂再次确认。`,
+    };
+    return { kind: 'voided', book: { ...book, receipts: [processed, ...book.receipts] }, receipt: processed };
+  }
+
+  const confirmations = { ...book.confirmations };
+  const entries = receipt.entries.map((entry): ProcessedReceiptEntry => {
+    const step = stepById.get(entry.stepId);
+    if (!step) return { ...entry, outcome: 'missing-step' };
+    if (confirmations[entry.stepId]) return { ...entry, outcome: 'already-confirmed' };
+    confirmations[entry.stepId] = {
+      stepId: entry.stepId,
+      title: step.title,
+      completed: entry.completed,
+      receiptId: receipt.id,
+      device: receipt.device,
+      issuedAt: receipt.issuedAt,
+      mergedAt: receivedAt,
+    };
+    return { ...entry, outcome: 'confirmed' };
+  });
+
+  const confirmedCount = entries.filter((entry) => entry.outcome === 'confirmed').length;
+  const processed: ProcessedReceipt = {
+    ...receipt,
+    receivedAt,
+    status: 'merged',
+    entries,
+    note: `已并入，新确认 ${confirmedCount} 个步骤。`,
+  };
+  return { kind: 'merged', book: { receipts: [processed, ...book.receipts], confirmations }, receipt: processed };
+}
+
 export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
+export const RECEIPT_STORAGE_KEY = 'sologsb-1012-sign-course-receipts-v1';
+export const CLASSROOM_STORAGE_KEY = 'sologsb-1012-classroom-tablet-v1';
 
 export function createDemoProject(): CourseProject {
+  const stepTimestamp = new Date().toISOString();
   const modules: CourseModule[] = [
     {
       id: 'module-1',
@@ -92,6 +246,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [4, 16, 28],
+          updatedAt: stepTimestamp,
         },
         {
           id: 'step-1-2',
@@ -112,6 +267,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-1',
           difficulty: '入门',
           cuePoints: [6, 24, 42],
+          updatedAt: stepTimestamp,
         },
         {
           id: 'step-1-3',
@@ -132,6 +288,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-1-2',
           difficulty: '进阶',
           cuePoints: [10, 34, 57],
+          updatedAt: stepTimestamp,
         },
       ],
     },
@@ -160,6 +317,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: '',
           difficulty: '入门',
           cuePoints: [8, 26, 44],
+          updatedAt: stepTimestamp,
         },
         {
           id: 'step-2-2',
@@ -180,6 +338,7 @@ export function createDemoProject(): CourseProject {
           prerequisiteId: 'step-2-1',
           difficulty: '进阶',
           cuePoints: [5, 22, 37],
+          updatedAt: stepTimestamp,
         },
       ],
     },
@@ -253,4 +412,16 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
 
 export function cloneProject(project: CourseProject): CourseProject {
   return structuredClone(project);
+}
+
+/** 兼容旧版本地存档：为没有 updatedAt 的步骤回填时间戳 */
+export function migrateProject(project: CourseProject): CourseProject {
+  const fallback = project.lastSavedAt || new Date().toISOString();
+  return {
+    ...project,
+    modules: (project.modules ?? []).map((module) => ({
+      ...module,
+      steps: (module.steps ?? []).map((step) => ({ ...step, updatedAt: step.updatedAt ?? fallback })),
+    })),
+  };
 }
